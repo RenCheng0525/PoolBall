@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>3D撞球檯模擬器</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+
+        #controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 5px;
+            z-index: 100;
+        }
+
+        #controls button {
+            display: block;
+            width: 100%;
+            margin: 5px 0;
+            padding: 8px;
+            background: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        #controls button:hover {
+            background: #1976D2;
+        }
+
+        #powerBar {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 200px;
+            height: 20px;
+            background: #ddd;
+            display: none;
+        }
+
+        #powerFill {
+            width: 0%;
+            height: 100%;
+            background: #f00;
+            transition: width 0.1s;
+        }
+
+        #message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            display: none;
+            font-size: 20px;
+            z-index: 100;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="controls">
+        <button id="newGameBtn">新遊戲</button>
+        <button id="returnWhiteBallBtn">放回白球</button>
+    </div>
+    <div id="message">按一下滑鼠, 以便重新瞄準</div>
+    <div id="powerBar">
+        <div id="powerFill"></div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.159.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.159.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // 常量定義 (依據國際標準)
+        // 尺寸
+        const TABLE_LENGTH = 2.54; // 254cm
+        const TABLE_WIDTH = 1.27;  // 127cm
+        const TABLE_HEIGHT = 0.74; // 74cm
+        const TABLE_SURFACE_THICKNESS = 0.0254; // 1英寸檯面厚度
+
+        // 球和球袋
+        const BALL_RADIUS = 0.028575; // 57.15mm球直徑的一半
+        const CORNER_POCKET_RADIUS = BALL_RADIUS * 1.4; // 比球大約40%
+        const MIDDLE_POCKET_RADIUS = BALL_RADIUS * 1.5; // 中袋稍大
+        const POCKET_ANGLE = Math.PI / 4; // 45度角的球袋開口
+
+        // 緩衝墊和框架
+        const CUSHION_HEIGHT = 0.04;  // 4cm
+        const CUSHION_WIDTH = 0.02;   // 2cm
+        const CUSHION_COLOR = 0x8B4513; // 木頭色
+
+        // 全局變量
+        let balls = [];
+        let ballBodies = [];
+        const mouse = new THREE.Vector2();
+        const raycaster = new THREE.Raycaster();
+
+        // 場景設置
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, TABLE_HEIGHT + 1.5, 2);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // 控制器設置
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2;
+        controls.target.set(0, TABLE_HEIGHT, 0);
+        controls.update();
+
+        // 物理世界設置
+        const world = new CANNON.World();
+        world.gravity.set(0, -9.82, 0);
+        world.broadphase = new CANNON.NaiveBroadphase();
+        world.solver.iterations = 20;
+        world.defaultContactMaterial.friction = 0.3;
+        world.defaultContactMaterial.restitution = 0.7;
+
+        // 材質設置
+        const groundMaterial = new CANNON.Material('ground');
+        const ballMaterial = new CANNON.Material('ball');
+        const cushionMaterial = new CANNON.Material('cushion');
+
+        const ball_ground = new CANNON.ContactMaterial(ballMaterial, groundMaterial, {
+            friction: 0.8,
+            restitution: 0.6
+        });
+        world.addContactMaterial(ball_ground);
+
+        const ball_cushion = new CANNON.ContactMaterial(ballMaterial, cushionMaterial, {
+            friction: 0.3,
+            restitution: 0.9
+        });
+        world.addContactMaterial(ball_cushion);
+
+        const ball_ball = new CANNON.ContactMaterial(ballMaterial, ballMaterial, {
+            friction: 0.4,
+            restitution: 0.95,
+            contactEquationStiffness: 1e8,
+            contactEquationRelaxation: 3
+        });
+        world.addContactMaterial(ball_ball);
+
+        // 瞄準線設置
+        const aimLine = new THREE.Group();
+        scene.add(aimLine);
+
+        const lineMaterial = new THREE.LineDashedMaterial({
+            color: 0xffffff,
+            dashSize: 0.1,
+            gapSize: 0.05
+        });
+
+        const reflectLineMaterial = new THREE.LineDashedMaterial({
+            color: 0xff0000,
+            dashSize: 0.05,
+            gapSize: 0.05
+        });
+
+        // 創建射線檢測平面
+        const tablePlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(TABLE_WIDTH, TABLE_LENGTH),
+            new THREE.MeshBasicMaterial({ visible: false })
+        );
+        tablePlane.position.y = TABLE_HEIGHT + BALL_RADIUS;
+        tablePlane.rotation.x = -Math.PI / 2;
+        scene.add(tablePlane);
+
+        // 燈光設置
+        const ambientLight = new THREE.AmbientLight(0xBBBBBB);
+        scene.add(ambientLight);
+
+        const light = new THREE.DirectionalLight(0xffffff, 1);
+        light.position.set(10, TABLE_HEIGHT + 10, 10);
+        light.castShadow = true;
+        light.shadow.mapSize.width = 2048;
+        light.shadow.mapSize.height = 2048;
+        scene.add(light);
+
+        // 創建球桌函數
+        function createTable() {
+            // 桌面的主體部分（不含洞口的區域）
+            const tableTopMaterial = new THREE.MeshStandardMaterial({ color: 0x1B5E20 });
+
+            // 為每個洞口創建幾何體並從主桌面減去
+            const pocketPositions = [
+                // 四個角袋
+                { x: -TABLE_WIDTH / 2, z: -TABLE_LENGTH / 2, radius: CORNER_POCKET_RADIUS * 0.8 },
+                { x: TABLE_WIDTH / 2, z: -TABLE_LENGTH / 2, radius: CORNER_POCKET_RADIUS * 0.8 },
+                { x: -TABLE_WIDTH / 2, z: TABLE_LENGTH / 2, radius: CORNER_POCKET_RADIUS * 0.8 },
+                { x: TABLE_WIDTH / 2, z: TABLE_LENGTH / 2, radius: CORNER_POCKET_RADIUS * 0.8 },
+                // 兩個中袋
+                { x: -TABLE_WIDTH / 2, z: 0, radius: MIDDLE_POCKET_RADIUS * 0.8 },
+                { x: TABLE_WIDTH / 2, z: 0, radius: MIDDLE_POCKET_RADIUS * 0.8 }
+            ];
+
+            // 將洞口從桌面幾何體中減去
+            let pocketHoles = new THREE.Shape();
+            pocketHoles.moveTo(-TABLE_WIDTH / 2, -TABLE_LENGTH / 2);
+            pocketHoles.lineTo(TABLE_WIDTH / 2, -TABLE_LENGTH / 2);
+            pocketHoles.lineTo(TABLE_WIDTH / 2, TABLE_LENGTH / 2);
+            pocketHoles.lineTo(-TABLE_WIDTH / 2, TABLE_LENGTH / 2);
+            pocketHoles.lineTo(-TABLE_WIDTH / 2, -TABLE_LENGTH / 2);
+
+            pocketPositions.forEach(pocket => {
+                const circleShape = new THREE.Path();
+                circleShape.absarc(pocket.x, pocket.z, pocket.radius, 0, Math.PI * 2, true);
+                pocketHoles.holes.push(circleShape);
+            });
+
+            const tableGeometry = new THREE.ExtrudeGeometry(pocketHoles, {
+                depth: TABLE_SURFACE_THICKNESS,
+                bevelEnabled: false
+            });
+
+            const tableTopMesh = new THREE.Mesh(tableGeometry, tableTopMaterial);
+            tableTopMesh.rotation.x = -Math.PI / 2;
+            tableTopMesh.position.y = TABLE_HEIGHT;
+            tableTopMesh.receiveShadow = true;
+            scene.add(tableTopMesh);
+
+            // 桌面物理體 (使用和視覺相同的形狀)
+            const tableShape = new CANNON.Box(new CANNON.Vec3(TABLE_WIDTH / 2, TABLE_SURFACE_THICKNESS / 2, TABLE_LENGTH / 2));
+            const tableBody = new CANNON.Body({
+                mass: 0,
+                material: groundMaterial,
+                position: new CANNON.Vec3(0, TABLE_HEIGHT, 0)
+            });
+            tableBody.addShape(tableShape);
+            world.addBody(tableBody);
+
+            // 球桌框架 - 上層框架
+            const frameThickness = 0.05;  // 5cm
+            const frameMaterial = new THREE.MeshStandardMaterial({ color: CUSHION_COLOR });
+
+            // 長邊框架
+            for (let side of [-1, 1]) {
+                const longSideGeometry = new THREE.BoxGeometry(frameThickness, 0.1, TABLE_LENGTH + frameThickness * 2);
+                const longSide = new THREE.Mesh(longSideGeometry, frameMaterial);
+                longSide.position.set(side * (TABLE_WIDTH / 2 + frameThickness / 2), TABLE_HEIGHT - 0.02, 0);
+                longSide.receiveShadow = true;
+                longSide.castShadow = true;
+                scene.add(longSide);
+            }
+
+            // 短邊框架
+            for (let side of [-1, 1]) {
+                const shortSideGeometry = new THREE.BoxGeometry(TABLE_WIDTH + frameThickness * 2, 0.1, frameThickness);
+                const shortSide = new THREE.Mesh(shortSideGeometry, frameMaterial);
+                shortSide.position.set(0, TABLE_HEIGHT - 0.02, side * (TABLE_LENGTH / 2 + frameThickness / 2));
+                shortSide.receiveShadow = true;
+                shortSide.castShadow = true;
+                scene.add(shortSide);
+            }
+
+            // 四支桌腳
+            const legRadius = 0.1;  // 20cm直徑的一半
+            const legHeight = TABLE_HEIGHT;  // 桌子高度
+            const legMaterial = new THREE.MeshStandardMaterial({ color: 0x808080 }); // 銀色
+
+            const legPositions = [
+                { x: TABLE_WIDTH / 2 - 0.2, z: TABLE_LENGTH / 2 - 0.2 },
+                { x: -TABLE_WIDTH / 2 + 0.2, z: TABLE_LENGTH / 2 - 0.2 },
+                { x: TABLE_WIDTH / 2 - 0.2, z: -TABLE_LENGTH / 2 + 0.2 },
+                { x: -TABLE_WIDTH / 2 + 0.2, z: -TABLE_LENGTH / 2 + 0.2 }
+            ];
+
+            legPositions.forEach(pos => {
+                const legGeometry = new THREE.CylinderGeometry(legRadius, legRadius, legHeight, 32);
+                const leg = new THREE.Mesh(legGeometry, legMaterial);
+                leg.position.set(pos.x, legHeight / 2, pos.z);
+                leg.castShadow = true;
+                scene.add(leg);
+            });
+
+            createCushions();
+            createPockets();
+        }
+
+        function createPocketCushion(start, end, height) {
+            const direction = new THREE.Vector3().subVectors(end, start).normalize();
+            const length = start.distanceTo(end);
+
+            // 創建主體緩衝墊
+            const cushionGeometry = new THREE.BoxGeometry(length, height, CUSHION_WIDTH);
+            const cushionMaterial = new THREE.MeshStandardMaterial({ color: CUSHION_COLOR });
+            const cushion = new THREE.Mesh(cushionGeometry, cushionMaterial);
+
+            cushion.position.set(
+                (start.x + end.x) / 2,
+                TABLE_HEIGHT + height / 2,
+                (start.z + end.z) / 2
+            );
+            cushion.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), direction);
+            cushion.castShadow = true;
+            scene.add(cushion);
+
+            // 添加球袋上方的突出部分
+            const overhangWidth = CUSHION_WIDTH * 1.5;  // 突出部分寬度
+            const overhangHeight = height * 0.3;        // 突出部分高度
+            const overhangGeometry = new THREE.BoxGeometry(length, overhangHeight, overhangWidth);
+            const overhang = new THREE.Mesh(overhangGeometry, cushionMaterial);
+
+            overhang.position.set(
+                (start.x + end.x) / 2,
+                TABLE_HEIGHT + height + overhangHeight / 2,
+                (start.z + end.z) / 2
+            );
+            overhang.quaternion.copy(cushion.quaternion);
+            overhang.castShadow = true;
+            scene.add(overhang);
+
+            // 物理體保持不變
+            const cushionShape = new CANNON.Box(new CANNON.Vec3(length / 2, height / 2, CUSHION_WIDTH / 2));
+            const cushionBody = new CANNON.Body({
+                mass: 0,
+                material: cushionMaterial
+            });
+            cushionBody.position.copy(cushion.position);
+            cushionBody.quaternion.copy(cushion.quaternion);
+            cushionBody.addShape(cushionShape);
+            world.addBody(cushionBody);
+        }
+
+        function createCushions() {
+            const pocketSize = CORNER_POCKET_RADIUS * 2;
+            const angle = Math.PI / 4;  // 45度角
+            const angleOffset = pocketSize * Math.cos(angle);
+
+            // 長邊緩衝墊（每側兩段）
+            const sideY = TABLE_HEIGHT + CUSHION_HEIGHT / 2;
+            for (let side of [-1, 1]) {  // 左右兩側
+                const x = side * TABLE_WIDTH / 2;
+
+                // 上半段
+                createPocketCushion(
+                    new THREE.Vector3(x, sideY, -angleOffset),
+                    new THREE.Vector3(x, sideY, -TABLE_LENGTH / 2 + angleOffset),
+                    CUSHION_HEIGHT
+                );
+
+                // 下半段
+                createPocketCushion(
+                    new THREE.Vector3(x, sideY, angleOffset),
+                    new THREE.Vector3(x, sideY, TABLE_LENGTH / 2 - angleOffset),
+                    CUSHION_HEIGHT
+                );
+            }
+
+            // 短邊緩衝墊（上下兩端各一段）
+            for (let side of [-1, 1]) {  // 上下兩端
+                const z = side * TABLE_LENGTH / 2;
+
+                createPocketCushion(
+                    new THREE.Vector3(-TABLE_WIDTH / 2 + angleOffset, sideY, z),
+                    new THREE.Vector3(TABLE_WIDTH / 2 - angleOffset, sideY, z),
+                    CUSHION_HEIGHT
+                );
+            }
+        }
+
+        function createPocket(x, z, isCorner) {
+            const radius = isCorner ? CORNER_POCKET_RADIUS : MIDDLE_POCKET_RADIUS;
+
+            // 創建球袋的深色背景圈
+            const ringGeometry = new THREE.RingGeometry(radius * 0.8, radius * 1.2, 32);
+            const ringMaterial = new THREE.MeshBasicMaterial({
+                color: 0x000000,
+                side: THREE.DoubleSide
+            });
+            const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+            ring.rotation.x = -Math.PI / 2;
+            ring.position.set(x, TABLE_HEIGHT + 0.001, z);
+            scene.add(ring);
+
+            // 創建球袋的黑色內部
+            const holeGeometry = new THREE.CircleGeometry(radius * 0.8, 32);
+            const holeMaterial = new THREE.MeshBasicMaterial({
+                color: 0x000000,
+                side: THREE.DoubleSide
+            });
+            const hole = new THREE.Mesh(holeGeometry, holeMaterial);
+            hole.rotation.x = -Math.PI / 2;
+            hole.position.set(x, TABLE_HEIGHT + 0.001, z);
+            scene.add(hole);
+
+            // 物理碰撞檢測
+            const pocketShape = new CANNON.Cylinder(radius * 1.2, radius * 1.2, 0.1, 8);
+            const pocketBody = new CANNON.Body({
+                isTrigger: true,
+                mass: 0,
+                position: new CANNON.Vec3(x, TABLE_HEIGHT - 0.05, z)
+            });
+            pocketBody.addShape(pocketShape);
+            world.addBody(pocketBody);
+
+            // 進袋檢測
+            pocketBody.addEventListener('collide', (e) => {
+                const ballBody = e.body;
+                const ballIndex = ballBodies.indexOf(ballBody);
+                if (ballIndex !== -1) {
+                    scene.remove(balls[ballIndex]);
+                    world.remove(ballBody);
+                    balls.splice(ballIndex, 1);
+                    ballBodies.splice(ballIndex, 1);
+                }
+            });
+        }
+
+        function createPockets() {
+            // 創建四個角袋
+            createPocket(-TABLE_WIDTH / 2, -TABLE_LENGTH / 2, true);
+            createPocket(TABLE_WIDTH / 2, -TABLE_LENGTH / 2, true);
+            createPocket(-TABLE_WIDTH / 2, TABLE_LENGTH / 2, true);
+            createPocket(TABLE_WIDTH / 2, TABLE_LENGTH / 2, true);
+
+            // 創建兩個中袋
+            createPocket(-TABLE_WIDTH / 2, 0, false);
+            createPocket(TABLE_WIDTH / 2, 0, false);
+        }
+
+        function createBall(position, color = 0xffffff) {
+            position.y = TABLE_HEIGHT + BALL_RADIUS;
+
+            const ballGeometry = new THREE.SphereGeometry(BALL_RADIUS);
+            const ballMaterial = new THREE.MeshStandardMaterial({
+                color: color,
+                metalness: 0.1,
+                roughness: 0.2
+            });
+            const ballMesh = new THREE.Mesh(ballGeometry, ballMaterial);
+            ballMesh.castShadow = true;
+            ballMesh.position.copy(position);
+            scene.add(ballMesh);
+
+            const ballShape = new CANNON.Sphere(BALL_RADIUS);
+            const ballBody = new CANNON.Body({
+                mass: 0.17,
+                material: ballMaterial,
+                linearDamping: 0.3,
+                angularDamping: 0.3,
+                allowSleep: false
+            });
+
+            ballBody.addShape(ballShape);
+            ballBody.position.copy(position);
+
+            world.addBody(ballBody);
+
+            balls.push(ballMesh);
+            ballBodies.push(ballBody);
+
+            return { mesh: ballMesh, body: ballBody };
+        }
+
+        function createAimLine() {
+            while (aimLine.children.length > 0) {
+                aimLine.remove(aimLine.children[0]);
+            }
+
+            const cueBall = ballBodies[0];
+            if (!cueBall) return;
+
+            // 如果沒有滑鼠事件，使用預設的瞄準點
+            let hitPoint;
+            if (mouse.x === 0 && mouse.y === 0) {
+                // 預設瞄準點：母球前方
+                hitPoint = new THREE.Vector3(
+                    cueBall.position.x,
+                    cueBall.position.y,
+                    cueBall.position.z - 0.5  // 往前瞄準0.5單位
+                );
+            } else {
+                raycaster.setFromCamera(mouse, camera);
+                const intersects = raycaster.intersectObject(tablePlane);
+                if (intersects.length > 0) {
+                    hitPoint = intersects[0].point;
+                } else {
+                    return;  // 如果沒有交點就不創建瞄準線
+                }
+            }
+
+            const direction = new THREE.Vector3()
+                .subVectors(hitPoint, new THREE.Vector3(cueBall.position.x, cueBall.position.y, cueBall.position.z))
+                .normalize();
+
+            const lineGeometry = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(cueBall.position.x, cueBall.position.y, cueBall.position.z),
+                hitPoint
+            ]);
+            const line = new THREE.Line(lineGeometry, lineMaterial);
+            line.computeLineDistances();
+            aimLine.add(line);
+
+            const extendPoint = new THREE.Vector3()
+                .copy(hitPoint)
+                .add(direction.multiplyScalar(0.5));
+            const extendGeometry = new THREE.BufferGeometry().setFromPoints([
+                hitPoint,
+                extendPoint
+            ]);
+            const extendLine = new THREE.Line(extendGeometry, reflectLineMaterial);
+            extendLine.computeLineDistances();
+            aimLine.add(extendLine);
+        }
+
+        function initGame() {
+            // 清除現有的瞄準線
+            while (aimLine.children.length > 0) {
+                aimLine.remove(aimLine.children[0]);
+            }
+
+            // 清除所有球
+            balls.forEach(ball => scene.remove(ball));
+            ballBodies.forEach(body => world.remove(body));
+            balls.length = 0;
+            ballBodies.length = 0;
+
+            // 重置滑鼠位置和力量設定
+            mouse.x = 0;
+            mouse.y = -0.5;  // 向前瞄準
+            power = 0;
+            isPoweringUp = false;
+            powerBar.style.display = 'none';
+            powerFill.style.width = '0%';
+
+            // 重新創建球桌
+            createTable();
+
+            // 創建母球
+            const cueBall = createBall(
+                new THREE.Vector3(0, TABLE_HEIGHT + BALL_RADIUS + 0.001, TABLE_LENGTH / 4),
+                0xFFFFFF
+            );
+
+            // 創建目標球三角形陣列
+            const colors = [0xFF0000, 0xFFFF00, 0x0000FF, 0x800080, 0xFFA500, 0x008000, 0x8B4513];
+            let ballCount = 0;
+            const startZ = -TABLE_LENGTH / 4;
+
+            for (let row = 0; row < 5; row++) {
+                for (let col = 0; col <= row; col++) {
+                    if (ballCount < 15) {
+                        const x = (col - row / 2) * (BALL_RADIUS * 2.1);
+                        const z = startZ + row * (BALL_RADIUS * 1.73);
+                        createBall(
+                            new THREE.Vector3(x, TABLE_HEIGHT + BALL_RADIUS + 0.001, z),
+                            colors[ballCount % colors.length]
+                        );
+                        ballCount++;
+                    }
+                }
+            }
+
+            // 確保所有球都處於靜止狀態
+            ballBodies.forEach(body => {
+                body.velocity.setZero();
+                body.angularVelocity.setZero();
+                body.wakeUp();
+            });
+
+            // 重設視角
+            camera.position.set(0, TABLE_HEIGHT + 1.5, 2);
+            controls.target.set(0, TABLE_HEIGHT, 0);
+            controls.update();
+
+            createAimLine();
+        }
+
+        function shootCueBall() {
+            if (!ballBodies[0] || aimLine.children.length === 0) return;
+
+            const force = power * 0.02;
+            const cueBallBody = ballBodies[0];
+
+            const positions = aimLine.children[0].geometry.attributes.position.array;
+            const startPoint = new THREE.Vector3(positions[0], positions[1], positions[2]);
+            const endPoint = new THREE.Vector3(positions[3], positions[4], positions[5]);
+
+            const direction = new THREE.Vector3()
+                .subVectors(endPoint, startPoint)
+                .normalize();
+
+            cueBallBody.applyImpulse(
+                new CANNON.Vec3(direction.x * force, 0, direction.z * force),
+                cueBallBody.position
+            );
+        }
+
+        let power = 0;
+        let isPoweringUp = false;
+
+        function powerUp() {
+            if (isPoweringUp) {
+                power = (power + 2) % 100;
+                powerFill.style.width = power + '%';
+                requestAnimationFrame(powerUp);
+            }
+        }
+
+        renderer.domElement.addEventListener('mousemove', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            createAimLine();
+        });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.code === 'Space' && !isPoweringUp) {
+                isPoweringUp = true;
+                powerBar.style.display = 'block';
+                powerUp();
+            }
+        });
+
+        document.addEventListener('keyup', (event) => {
+            if (event.code === 'Space' && isPoweringUp) {
+                isPoweringUp = false;
+                shootCueBall();
+                power = 0;
+                powerBar.style.display = 'none';
+                powerFill.style.width = '0%';
+            }
+        });
+
+        document.getElementById('newGameBtn').addEventListener('click', () => {
+            window.location.reload();
+        });
+
+        document.getElementById('returnWhiteBallBtn').addEventListener('click', () => {
+            // 先找找看有沒有白球
+            const whiteIndex = balls.findIndex(ball =>
+                ball.material.color.getHex() === 0xFFFFFF
+            );
+
+            if (whiteIndex !== -1) {
+                // 如果白球存在，重置位置
+                const whiteBall = ballBodies[whiteIndex];
+                whiteBall.position.set(0, TABLE_HEIGHT + BALL_RADIUS, TABLE_LENGTH / 4);
+                whiteBall.velocity.setZero();
+                whiteBall.angularVelocity.setZero();
+                whiteBall.wakeUp();
+            } else {
+                // 如果白球不存在，創建新的白球
+                const cueBall = createBall(
+                    new THREE.Vector3(0, TABLE_HEIGHT + BALL_RADIUS, TABLE_LENGTH / 4),
+                    0xFFFFFF
+                );
+                // 確保白球是第一個球
+                if (balls.length > 1) {
+                    const lastIndex = balls.length - 1;
+                    [balls[0], balls[lastIndex]] = [balls[lastIndex], balls[0]];
+                    [ballBodies[0], ballBodies[lastIndex]] = [ballBodies[lastIndex], ballBodies[0]];
+                }
+            }
+
+            createAimLine();
+
+            // 顯示提示訊息
+            const message = document.getElementById('message');
+            message.style.display = 'block';
+
+            // 2秒後自動隱藏
+            setTimeout(() => {
+                message.style.display = 'none';
+            }, 2000);
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            world.step(1 / 60);
+
+            for (let i = 0; i < balls.length; i++) {
+                balls[i].position.copy(ballBodies[i].position);
+                balls[i].quaternion.copy(ballBodies[i].quaternion);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        initGame();
+        animate();
+    </script>
+</body>
+
+</html>
